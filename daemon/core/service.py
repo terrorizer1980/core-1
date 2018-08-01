@@ -944,6 +944,8 @@ class CoreService(object):
         if value:
             if key == "startidx":
                 value = int(value)
+            elif key == "starttime":
+                value = float(value)
             elif key == "meta":
                 value = str(value)
             else:
