@@ -19,7 +19,7 @@ from core.emulator.enumerations import (
     RegisterTlvs,
 )
 from core.errors import CoreCommandError, CoreError
-from core.executables import EBTABLES, TC
+from core.executables import NFTABLES, TC
 from core.nodes.base import CoreNetworkBase
 from core.nodes.interface import CoreInterface, GreTap, Veth
 from core.nodes.netclient import get_net_client
@@ -97,15 +97,6 @@ class EbtablesQueue:
             self.updatethread.join()
             self.updatethread = None
 
-    def ebatomiccmd(self, cmd: str) -> str:
-        """
-        Helper for building ebtables atomic file command list.
-
-        :param cmd: ebtable command
-        :return: ebtable atomic command
-        """
-        return f"{EBTABLES} --atomic-file {self.atomic_file} {cmd}"
-
     def lastupdate(self, wlan: "CoreNetwork") -> float:
         """
         Return the time elapsed since this WLAN was last updated.
@@ -118,7 +109,6 @@ class EbtablesQueue:
         except KeyError:
             self.last_update_time[wlan] = time.monotonic()
             elapsed = 0.0
-
         return elapsed
 
     def updated(self, wlan: "CoreNetwork") -> None:
@@ -166,24 +156,19 @@ class EbtablesQueue:
 
         :return: nothing
         """
-        # save kernel ebtables snapshot to a file
-        args = self.ebatomiccmd("--atomic-save")
-        wlan.host_cmd(args)
-
-        # modify the table file using queued ebtables commands
+        if not self.cmds:
+            return
+        # write out nft commands to file
         for c in self.cmds:
-            args = self.ebatomiccmd(c)
-            wlan.host_cmd(args)
-        self.cmds = []
-
-        # commit the table file to the kernel
-        args = self.ebatomiccmd("--atomic-commit")
-        wlan.host_cmd(args)
-
+            wlan.host_cmd(f"echo {c} >> {self.atomic_file}", shell=True)
+        # read file as atomic change
+        wlan.host_cmd(f"{NFTABLES} -f {self.atomic_file}")
+        # remove file
         try:
             wlan.host_cmd(f"rm -f {self.atomic_file}")
         except CoreCommandError:
             logging.exception("error removing atomic file: %s", self.atomic_file)
+        self.cmds = []
 
     def ebchange(self, wlan: "CoreNetwork") -> None:
         """
@@ -205,31 +190,33 @@ class EbtablesQueue:
         with wlan._linked_lock:
             if wlan.has_ebtables_chain:
                 # flush the chain
-                self.cmds.append(f"-F {wlan.brname}")
+                self.cmds.append(f"flush table bridge {wlan.brname}")
             else:
                 wlan.has_ebtables_chain = True
-                self.cmds.extend(
-                    [
-                        f"-N {wlan.brname} -P {wlan.policy.value}",
-                        f"-A FORWARD --logical-in {wlan.brname} -j {wlan.brname}",
-                    ]
+                policy = wlan.policy.value.lower()
+                self.cmds.append(f"add table bridge {wlan.brname}")
+                self.cmds.append(
+                    f"add chain bridge {wlan.brname} forward {{type filter hook "
+                    f"forward priority 0\\; policy {policy}\\;}}"
                 )
             # rebuild the chain
             for iface1, v in wlan._linked.items():
-                for oface2, linked in v.items():
+                for iface2, linked in v.items():
+                    policy = None
                     if wlan.policy == NetworkPolicy.DROP and linked:
-                        self.cmds.extend(
-                            [
-                                f"-A {wlan.brname} -i {iface1.localname} -o {oface2.localname} -j ACCEPT",
-                                f"-A {wlan.brname} -o {iface1.localname} -i {oface2.localname} -j ACCEPT",
-                            ]
-                        )
+                        policy = "accept"
                     elif wlan.policy == NetworkPolicy.ACCEPT and not linked:
-                        self.cmds.extend(
-                            [
-                                f"-A {wlan.brname} -i {iface1.localname} -o {oface2.localname} -j DROP",
-                                f"-A {wlan.brname} -o {iface1.localname} -i {oface2.localname} -j DROP",
-                            ]
+                        policy = "drop"
+                    if policy:
+                        self.cmds.append(
+                            f"add rule bridge {wlan.brname} forward "
+                            f"iifname {iface1.localname} oifname {iface2.localname} "
+                            f"{policy}"
+                        )
+                        self.cmds.append(
+                            f"add rule bridge {wlan.brname} forward "
+                            f"oifname {iface1.localname} iifname {iface2.localname} "
+                            f"{policy}"
                         )
 
 
@@ -337,10 +324,7 @@ class CoreNetwork(CoreNetworkBase):
         try:
             self.net_client.delete_bridge(self.brname)
             if self.has_ebtables_chain:
-                cmds = [
-                    f"{EBTABLES} -D FORWARD --logical-in {self.brname} -j {self.brname}",
-                    f"{EBTABLES} -X {self.brname}",
-                ]
+                cmds = [f"{NFTABLES} delete table bridge {self.brname}"]
                 ebtablescmds(self.host_cmd, cmds)
         except CoreCommandError:
             logging.exception("error during shutdown")

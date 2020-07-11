@@ -10,6 +10,7 @@ EBTABLES: str = "ebtables"
 MOUNT: str = "mount"
 UMOUNT: str = "umount"
 OVS_VSCTL: str = "ovs-vsctl"
+NFTABLES: str = "nft"
 
 COMMON_REQUIREMENTS: List[str] = [SYSCTL, IP, ETHTOOL, TC, EBTABLES, MOUNT, UMOUNT]
 VCMD_REQUIREMENTS: List[str] = [VNODED, VCMD]
