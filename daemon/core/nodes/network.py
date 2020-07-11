@@ -31,30 +31,29 @@ if TYPE_CHECKING:
 
     WirelessModelType = Type[WirelessModel]
 
-ebtables_lock = threading.Lock()
+nftables_lock = threading.Lock()
 
 
-class EbtablesQueue:
+class NftablesQueue:
     """
-    Helper class for queuing up ebtables commands into rate-limited
+    Helper class for queuing up nftables commands into rate-limited
     atomic commits. This improves performance and reliability when there are
     many WLAN link updates.
     """
 
     # update rate is every 300ms
     rate: float = 0.3
-    # ebtables
-    atomic_file: str = "/tmp/pycore.ebtables.atomic"
+    atomic_file: str = "/tmp/pycore.nftables.atomic"
+    chain: str = "forward"
 
     def __init__(self) -> None:
         """
-        Initialize the helper class, but don't start the update thread
-        until a WLAN is instantiated.
+        Create a NftablesQueue instance.
         """
-        self.doupdateloop: bool = False
+        self.running: bool = False
         self.updatethread: Optional[threading.Thread] = None
         # this lock protects cmds and updates lists
-        self.updatelock: threading.Lock = threading.Lock()
+        self.lock: threading.Lock = threading.Lock()
         # list of pending ebtables commands
         self.cmds: List[str] = []
         # list of WLANs requiring update
@@ -63,74 +62,71 @@ class EbtablesQueue:
         # using this queue
         self.last_update_time: Dict["CoreNetwork", float] = {}
 
-    def startupdateloop(self, wlan: "CoreNetwork") -> None:
+    def start(self, net: "CoreNetwork") -> None:
         """
-        Kick off the update loop; only needs to be invoked once.
+        Start thread to listen for updates for the provided network.
 
+        :param net: network to start checking updates
         :return: nothing
         """
-        with self.updatelock:
-            self.last_update_time[wlan] = time.monotonic()
-        if self.doupdateloop:
-            return
-        self.doupdateloop = True
-        self.updatethread = threading.Thread(target=self.updateloop, daemon=True)
-        self.updatethread.start()
+        with self.lock:
+            self.last_update_time[net] = time.monotonic()
+            if self.running:
+                return
+            self.running = True
+            self.updatethread = threading.Thread(target=self.run, daemon=True)
+            self.updatethread.start()
 
-    def stopupdateloop(self, wlan: "CoreNetwork") -> None:
+    def stop(self, net: "CoreNetwork") -> None:
         """
-        Kill the update loop thread if there are no more WLANs using it.
+        Stop updates for network, when no networks remain, stop update thread.
 
+        :param net: network to stop watching updates
         :return: nothing
         """
-        with self.updatelock:
-            try:
-                del self.last_update_time[wlan]
-            except KeyError:
-                logging.exception(
-                    "error deleting last update time for wlan, ignored before: %s", wlan
-                )
-        if len(self.last_update_time) > 0:
-            return
-        self.doupdateloop = False
-        if self.updatethread:
-            self.updatethread.join()
-            self.updatethread = None
+        with self.lock:
+            self.last_update_time.pop(net, None)
+            if self.last_update_time:
+                return
+            self.running = False
+            if self.updatethread:
+                self.updatethread.join()
+                self.updatethread = None
 
-    def lastupdate(self, wlan: "CoreNetwork") -> float:
+    def last_update(self, net: "CoreNetwork") -> float:
         """
-        Return the time elapsed since this WLAN was last updated.
+        Return the time elapsed since this network was last updated.
 
-        :param wlan: wlan entity
+        :param net: wlan network
         :return: elpased time
         """
-        try:
-            elapsed = time.monotonic() - self.last_update_time[wlan]
-        except KeyError:
-            self.last_update_time[wlan] = time.monotonic()
+        if net in self.last_update_time:
+            elapsed = time.monotonic() - self.last_update_time[net]
+        else:
+            self.last_update_time[net] = time.monotonic()
             elapsed = 0.0
         return elapsed
 
-    def updated(self, wlan: "CoreNetwork") -> None:
+    def updated(self, net: "CoreNetwork") -> None:
         """
-        Keep track of when this WLAN was last updated.
+        Keep track of when this network was last updated.
 
-        :param wlan: wlan entity
+        :param net: wlan entity
         :return: nothing
         """
-        self.last_update_time[wlan] = time.monotonic()
-        self.updates.remove(wlan)
+        self.last_update_time[net] = time.monotonic()
+        self.updates.remove(net)
 
-    def updateloop(self) -> None:
+    def run(self) -> None:
         """
-        Thread target that looks for WLANs needing update, and
-        rate limits the amount of ebtables activity. Only one userspace program
-        should use ebtables at any given time, or results can be unpredictable.
+        Thread target that looks for networks needing updates, and
+        rate limits the amount of nftables activity. Only one userspace program
+        should use nftables at any given time, or results can be unpredictable.
 
         :return: nothing
         """
-        while self.doupdateloop:
-            with self.updatelock:
+        while self.running:
+            with self.lock:
                 for wlan in self.updates:
                     # Check if wlan is from a previously closed session. Because of the
                     # rate limiting scheme employed here, this may happen if a new session
@@ -143,89 +139,87 @@ class EbtablesQueue:
                         self.updated(wlan)
                         continue
 
-                    if self.lastupdate(wlan) > self.rate:
-                        self.buildcmds(wlan)
-                        self.ebcommit(wlan)
+                    if self.last_update(wlan) > self.rate:
+                        self.build_cmds(wlan)
+                        self.commit(wlan)
                         self.updated(wlan)
-
             time.sleep(self.rate)
 
-    def ebcommit(self, wlan: "CoreNetwork") -> None:
+    def commit(self, net: "CoreNetwork") -> None:
         """
-        Perform ebtables atomic commit using commands built in the self.cmds list.
+        Commit changes to nftables for the provided network.
 
+        :param net: network to commit nftables changes
         :return: nothing
         """
         if not self.cmds:
             return
         # write out nft commands to file
-        for c in self.cmds:
-            wlan.host_cmd(f"echo {c} >> {self.atomic_file}", shell=True)
+        for cmd in self.cmds:
+            net.host_cmd(f"echo {cmd} >> {self.atomic_file}", shell=True)
         # read file as atomic change
-        wlan.host_cmd(f"{NFTABLES} -f {self.atomic_file}")
+        net.host_cmd(f"{NFTABLES} -f {self.atomic_file}")
         # remove file
-        try:
-            wlan.host_cmd(f"rm -f {self.atomic_file}")
-        except CoreCommandError:
-            logging.exception("error removing atomic file: %s", self.atomic_file)
+        net.host_cmd(f"rm -f {self.atomic_file}")
         self.cmds = []
 
-    def ebchange(self, wlan: "CoreNetwork") -> None:
+    def update(self, net: "CoreNetwork") -> None:
         """
-        Flag a change to the given WLAN's _linked dict, so the ebtables
-        chain will be rebuilt at the next interval.
+        Flag this network has an update, so the nftables chain will be rebuilt.
 
+        :param net: wlan network
         :return: nothing
         """
-        with self.updatelock:
-            if wlan not in self.updates:
-                self.updates.append(wlan)
+        with self.lock:
+            if net not in self.updates:
+                self.updates.append(net)
 
-    def buildcmds(self, wlan: "CoreNetwork") -> None:
+    def build_cmds(self, net: "CoreNetwork") -> None:
         """
-        Inspect a _linked dict from a wlan, and rebuild the ebtables chain for that WLAN.
+        Inspect linked nodes for a network, and rebuild the nftables chain commands.
 
+        :param net: network to build commands for
         :return: nothing
         """
-        with wlan._linked_lock:
-            if wlan.has_ebtables_chain:
+        with net._linked_lock:
+            if net.has_ebtables_chain:
                 # flush the chain
-                self.cmds.append(f"flush table bridge {wlan.brname}")
+                self.cmds.append(f"flush table bridge {net.brname}")
             else:
-                wlan.has_ebtables_chain = True
-                policy = wlan.policy.value.lower()
-                self.cmds.append(f"add table bridge {wlan.brname}")
+                net.has_ebtables_chain = True
+                policy = net.policy.value.lower()
+                self.cmds.append(f"add table bridge {net.brname}")
                 self.cmds.append(
-                    f"add chain bridge {wlan.brname} forward {{type filter hook "
+                    f"add chain bridge {net.brname} {self.chain} {{type filter hook "
                     f"forward priority 0\\; policy {policy}\\;}}"
                 )
             # rebuild the chain
-            for iface1, v in wlan._linked.items():
+            for iface1, v in net._linked.items():
                 for iface2, linked in v.items():
                     policy = None
-                    if wlan.policy == NetworkPolicy.DROP and linked:
+                    if net.policy == NetworkPolicy.DROP and linked:
                         policy = "accept"
-                    elif wlan.policy == NetworkPolicy.ACCEPT and not linked:
+                    elif net.policy == NetworkPolicy.ACCEPT and not linked:
                         policy = "drop"
                     if policy:
                         self.cmds.append(
-                            f"add rule bridge {wlan.brname} forward "
-                            f"iifname {iface1.localname} oifname {iface2.localname} "
+                            f"add rule bridge {net.brname} {self.chain} "
+                            f"iif {iface1.localname} oif {iface2.localname} "
                             f"{policy}"
                         )
                         self.cmds.append(
-                            f"add rule bridge {wlan.brname} forward "
-                            f"oifname {iface1.localname} iifname {iface2.localname} "
+                            f"add rule bridge {net.brname} {self.chain} "
+                            f"oif {iface1.localname} iif {iface2.localname} "
                             f"{policy}"
                         )
 
 
 # a global object because all WLANs share the same queue
-# cannot have multiple threads invoking the ebtables commnd
-ebq: EbtablesQueue = EbtablesQueue()
+# cannot have multiple threads invoking the nftables commands
+nft_queue: NftablesQueue = NftablesQueue()
 
 
-def ebtablescmds(call: Callable[..., str], cmds: List[str]) -> None:
+def nftables_cmds(call: Callable[..., str], cmds: List[str]) -> None:
     """
     Run ebtable commands.
 
@@ -233,9 +227,9 @@ def ebtablescmds(call: Callable[..., str], cmds: List[str]) -> None:
     :param cmds: commands to call
     :return: nothing
     """
-    with ebtables_lock:
-        for args in cmds:
-            call(args)
+    with nftables_lock:
+        for cmd in cmds:
+            call(cmd)
 
 
 class CoreNetwork(CoreNetworkBase):
@@ -308,7 +302,7 @@ class CoreNetwork(CoreNetworkBase):
         self.net_client.create_bridge(self.brname)
         self.has_ebtables_chain = False
         self.up = True
-        ebq.startupdateloop(self)
+        nft_queue.start(self)
 
     def shutdown(self) -> None:
         """
@@ -319,13 +313,13 @@ class CoreNetwork(CoreNetworkBase):
         if not self.up:
             return
 
-        ebq.stopupdateloop(self)
+        nft_queue.stop(self)
 
         try:
             self.net_client.delete_bridge(self.brname)
             if self.has_ebtables_chain:
                 cmds = [f"{NFTABLES} delete table bridge {self.brname}"]
-                ebtablescmds(self.host_cmd, cmds)
+                nftables_cmds(self.host_cmd, cmds)
         except CoreCommandError:
             logging.exception("error during shutdown")
 
@@ -402,7 +396,7 @@ class CoreNetwork(CoreNetworkBase):
                 return
             self._linked[iface1][iface2] = False
 
-        ebq.ebchange(self)
+        nft_queue.update(self)
 
     def link(self, iface1: CoreInterface, iface2: CoreInterface) -> None:
         """
@@ -418,7 +412,7 @@ class CoreNetwork(CoreNetworkBase):
                 return
             self._linked[iface1][iface2] = True
 
-        ebq.ebchange(self)
+        nft_queue.update(self)
 
     def linkconfig(
         self, iface: CoreInterface, options: LinkOptions, iface2: CoreInterface = None
@@ -985,7 +979,7 @@ class WlanNode(CoreNetwork):
         """
         super().startup()
         self.net_client.disable_mac_learning(self.brname)
-        ebq.ebchange(self)
+        nft_queue.update(self)
 
     def attach(self, iface: CoreInterface) -> None:
         """
