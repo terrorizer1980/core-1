@@ -129,8 +129,8 @@ class NftablesQueue:
             with self.lock:
                 for wlan in self.updates:
                     # Check if wlan is from a previously closed session. Because of the
-                    # rate limiting scheme employed here, this may happen if a new session
-                    # is started soon after closing a previous session.
+                    # rate limiting scheme employed here, this may happen if a new
+                    # session is started soon after closing a previous session.
                     # TODO: if these are WlanNodes, this will never throw an exception
                     try:
                         wlan.session
@@ -183,7 +183,6 @@ class NftablesQueue:
         """
         with net._linked_lock:
             if net.has_ebtables_chain:
-                # flush the chain
                 self.cmds.append(f"flush table bridge {net.brname}")
             else:
                 net.has_ebtables_chain = True
@@ -193,6 +192,11 @@ class NftablesQueue:
                     f"add chain bridge {net.brname} {self.chain} {{type filter hook "
                     f"forward priority 0\\; policy {policy}\\;}}"
                 )
+            # add default rule to accept all traffic not for this bridge
+            self.cmds.append(
+                f"add rule bridge {net.brname} {self.chain} "
+                f"ibriport != {net.brname} accept"
+            )
             # rebuild the chain
             for iface1, v in net._linked.items():
                 for iface2, linked in v.items():
