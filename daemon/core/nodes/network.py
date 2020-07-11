@@ -127,22 +127,14 @@ class NftablesQueue:
         """
         while self.running:
             with self.lock:
-                for wlan in self.updates:
-                    # Check if wlan is from a previously closed session. Because of the
-                    # rate limiting scheme employed here, this may happen if a new
-                    # session is started soon after closing a previous session.
-                    # TODO: if these are WlanNodes, this will never throw an exception
-                    try:
-                        wlan.session
-                    except Exception:
-                        # Just mark as updated to remove from self.updates.
-                        self.updated(wlan)
+                for net in self.updates:
+                    if not net.up:
+                        self.updated(net)
                         continue
-
-                    if self.last_update(wlan) > self.rate:
-                        self.build_cmds(wlan)
-                        self.commit(wlan)
-                        self.updated(wlan)
+                    if self.last_update(net) > self.rate:
+                        self.build_cmds(net)
+                        self.commit(net)
+                        self.updated(net)
             time.sleep(self.rate)
 
     def commit(self, net: "CoreNetwork") -> None:
